@@ -16,6 +16,23 @@ type Scanner struct {
 	connectTimeout time.Duration
 }
 
+const (
+	maxChannelCap       = 4096
+	resultsBufPerWorker = 2
+	jobsBufPerWorker    = 8
+)
+
+func channelCap(concurrency, perWorker int) int {
+	size := concurrency * perWorker
+	if size > maxChannelCap {
+		return maxChannelCap
+	}
+	if size < 1 {
+		return 1
+	}
+	return size
+}
+
 func New(opts ...Option) (*Scanner, error) {
 	s := &Scanner{
 		concurrency:    100,
@@ -29,10 +46,10 @@ func New(opts ...Option) (*Scanner, error) {
 	}
 
 	if s.concurrency <= 0 {
-		return nil, fmt.Errorf("concurrency must be > 0")
+		return nil, ErrInvalidConcurrency
 	}
 	if s.connectTimeout <= 0 {
-		return nil, fmt.Errorf("connectTimeout must be > 0")
+		return nil, ErrInvalidTimeout
 	}
 	return s, nil
 }
@@ -44,11 +61,7 @@ type hostTarget struct {
 
 func (s *Scanner) Scan(ctx context.Context, hosts []string, ports PortSet) (<-chan Result, error) {
 	if len(hosts) == 0 {
-		return closedResults(), fmt.Errorf("hosts must not be empty")
-	}
-
-	if s == nil {
-		return closedResults(), fmt.Errorf("scanner is nil")
+		return closedResults(), ErrEmptyHosts
 	}
 
 	portList, err := ports.validateAndExpand()
@@ -64,22 +77,11 @@ func (s *Scanner) Scan(ctx context.Context, hosts []string, ports PortSet) (<-ch
 		return closedResults(), err
 	}
 	if len(targets) == 0 {
-		return closedResults(), fmt.Errorf("no valid hosts resolved")
+		return closedResults(), ErrNoHostsResolved
 	}
 
-	// буфер для результатов, чтобы воркеры меньше блокировались на записи в канал
-	resultsCap := 4096
-	if s.concurrency*2 < resultsCap {
-		resultsCap = s.concurrency * 2
-	}
-	// буфер для очереди задач (host+port)
-	jobsCap := 4096
-	if s.concurrency*8 < jobsCap {
-		jobsCap = s.concurrency * 8
-	}
-
-	results := make(chan Result, resultsCap)
-	jobs := make(chan job, jobsCap)
+	results := make(chan Result, channelCap(s.concurrency, resultsBufPerWorker))
+	jobs := make(chan job, channelCap(s.concurrency, jobsBufPerWorker))
 
 	var wg sync.WaitGroup
 	// стартуем ровно concurrency воркеров
@@ -98,12 +100,12 @@ func (s *Scanner) Scan(ctx context.Context, hosts []string, ports PortSet) (<-ch
 			close(results)
 		}()
 
-		for _, t := range targets {
-			for _, p := range portList {
+		for _, target := range targets {
+			for _, port := range portList {
 				select {
 				case <-ctx.Done():
 					return
-				case jobs <- job{target: t, port: p}:
+				case jobs <- job{target: target, port: port}:
 				}
 			}
 		}
@@ -118,19 +120,20 @@ type job struct {
 }
 
 func (s *Scanner) worker(ctx context.Context, jobs <-chan job, results chan<- Result) {
-	for j := range jobs {
+	for {
 		select {
 		case <-ctx.Done():
-			// скан отменили снаружи
 			return
-		default:
-		}
-		res := s.checkOne(ctx, j.target, j.port)
-		select {
-		case <-ctx.Done():
-			// если отмена случилась во время/после проверки не шлём результат в канал
-			return
-		case results <- res:
+		case current, ok := <-jobs:
+			if !ok {
+				return
+			}
+			res := s.checkOne(ctx, current.target, current.port)
+			select {
+			case <-ctx.Done():
+				return
+			case results <- res:
+			}
 		}
 	}
 }
@@ -139,7 +142,6 @@ func (s *Scanner) checkOne(ctx context.Context, target hostTarget, port uint16) 
 	start := time.Now()
 
 	dialer := &net.Dialer{
-		// этот Timeout работает как "таймаут на порт"
 		Timeout:   s.connectTimeout,
 		KeepAlive: 0,
 	}
@@ -206,4 +208,3 @@ func closedResults() <-chan Result {
 	close(ch)
 	return ch
 }
-

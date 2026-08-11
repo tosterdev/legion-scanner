@@ -10,9 +10,9 @@ import (
 func assertResolveError(t *testing.T, err error, kind resolveErrorKind, host string) {
 	t.Helper()
 
-	var re *ResolveError
+	var re ResolveError
 	if !errors.As(err, &re) {
-		t.Fatalf("expected *ResolveError, got %v", err)
+		t.Fatalf("expected ResolveError, got %v", err)
 	}
 	if re.Kind != kind {
 		t.Fatalf("expected kind %v, got %v", kind, re.Kind)
@@ -28,7 +28,7 @@ func TestResolveTargets_emptyHost(t *testing.T) {
 	for _, host := range []string{"", "   "} {
 		t.Run(host, func(t *testing.T) {
 			_, err := resolveTargets(ctx, []string{host})
-			assertResolveError(t, err, resolveErrInvalidHost, host)
+			assertResolveError(t, err, resolveErrInvalidHost, "")
 		})
 	}
 }

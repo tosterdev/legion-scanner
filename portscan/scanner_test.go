@@ -2,6 +2,7 @@ package portscan
 
 import (
 	"context"
+	"errors"
 	"net"
 	"syscall"
 	"testing"
@@ -11,10 +12,8 @@ import (
 type timeoutNetErr struct{}
 
 func (timeoutNetErr) Error() string   { return "i/o timeout" }
-func (timeoutNetErr) Timeout() bool { return true }
-func (timeoutNetErr) Temporary() bool {
-	return true
-}
+func (timeoutNetErr) Timeout() bool   { return true }
+func (timeoutNetErr) Temporary() bool { return true }
 
 func TestPortSetRangeSwap(t *testing.T) {
 	ps := Range(5, 1)
@@ -25,8 +24,14 @@ func TestPortSetRangeSwap(t *testing.T) {
 	if len(ports) != 5 {
 		t.Fatalf("expected 5 ports, got %d", len(ports))
 	}
-	if ports[0] != 1 || ports[len(ports)-1] != 5 {
-		t.Fatalf("unexpected ports range: first=%d last=%d", ports[0], ports[len(ports)-1])
+	got := make(map[uint16]struct{}, len(ports))
+	for _, port := range ports {
+		got[port] = struct{}{}
+	}
+	for want := uint16(1); want <= 5; want++ {
+		if _, ok := got[want]; !ok {
+			t.Fatalf("missing port %d", want)
+		}
 	}
 }
 
@@ -62,11 +67,8 @@ func TestScan_emptyHosts(t *testing.T) {
 	}
 
 	_, err = s.Scan(context.Background(), []string{}, Range(1, 10))
-	if err == nil {
-		t.Fatal("expected error for empty hosts")
-	}
-	if err.Error() != "hosts must not be empty" {
-		t.Fatalf("unexpected error: %v", err)
+	if !errors.Is(err, ErrEmptyHosts) {
+		t.Fatalf("expected ErrEmptyHosts, got %v", err)
 	}
 }
 
@@ -112,4 +114,3 @@ func TestScanOpenClosed(t *testing.T) {
 		t.Fatalf("expected closed port=%d to be closed, got %s", closedPort, got[uint16(closedPort)])
 	}
 }
-

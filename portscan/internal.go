@@ -7,10 +7,11 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 )
 
-type resolveErrorKind uint8
+type resolveErrorKind int
 
 const (
 	resolveErrInvalidHost resolveErrorKind = iota
@@ -23,38 +24,45 @@ type ResolveError struct {
 	Cause error
 }
 
-func (e *ResolveError) Error() string {
+func (e ResolveError) Error() string {
 	switch e.Kind {
 	case resolveErrInvalidHost:
+		if e.Cause != nil {
+			return fmt.Sprintf("invalid host: %q: %v", e.Host, e.Cause)
+		}
 		return fmt.Sprintf("invalid host: %q", e.Host)
 	case resolveErrUnresolvableDNS:
+		if e.Cause != nil {
+			return fmt.Sprintf("unresolvable DNS: %q: %v", e.Host, e.Cause)
+		}
 		return fmt.Sprintf("unresolvable DNS: %q", e.Host)
 	default:
 		return fmt.Sprintf("host resolve error: %q", e.Host)
 	}
 }
 
-func (e *ResolveError) Unwrap() error { return e.Cause }
+func (e ResolveError) Unwrap() error { return e.Cause }
 
 func resolveTargets(ctx context.Context, hosts []string) ([]hostTarget, error) {
 	seen := make(map[string]struct{}, len(hosts))
 	out := make([]hostTarget, 0, len(hosts))
+	dnsHosts := make([]string, 0)
 
-	for _, raw := range hosts {
-		h := strings.TrimSpace(raw)
-		if h == "" {
-			return nil, &ResolveError{Kind: resolveErrInvalidHost, Host: raw, Cause: errors.New("empty host")}
+	for _, rawHost := range hosts {
+		host := strings.TrimSpace(rawHost)
+		if host == "" {
+			return nil, ResolveError{Kind: resolveErrInvalidHost, Host: host, Cause: ErrEmptyHost}
 		}
 
-		ip := net.ParseIP(h)
+		ip := net.ParseIP(host)
 		var key string
 		if ip != nil {
-			key = "ip:" + ip.String()
+			key = ip.String()
 		} else {
-			key = "dns:" + strings.ToLower(h)
-			if looksLikeAddress(h) {
-				return nil, &ResolveError{Kind: resolveErrInvalidHost, Host: h, Cause: errors.New("parse ip failed")}
+			if looksLikeAddress(host) {
+				return nil, ResolveError{Kind: resolveErrInvalidHost, Host: host, Cause: ErrParseIPFailed}
 			}
+			key = strings.ToLower(host)
 		}
 
 		if _, ok := seen[key]; ok {
@@ -63,27 +71,84 @@ func resolveTargets(ctx context.Context, hosts []string) ([]hostTarget, error) {
 		seen[key] = struct{}{}
 
 		if ip != nil {
-			out = append(out, hostTarget{host: h, ip: ip})
+			out = append(out, hostTarget{host: host, ip: ip})
 			continue
 		}
-
-		ips, err := net.DefaultResolver.LookupIPAddr(ctx, h)
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return nil, err
-			}
-			return nil, &ResolveError{Kind: resolveErrUnresolvableDNS, Host: h, Cause: err}
-		}
-		for _, ipAddr := range ips {
-			out = append(out, hostTarget{host: h, ip: ipAddr.IP})
-		}
+		dnsHosts = append(dnsHosts, host)
 	}
 
+	if len(dnsHosts) == 0 {
+		return out, nil
+	}
+
+	resolved, err := lookupDNSParallel(ctx, dnsHosts)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, resolved...)
 	return out, nil
 }
 
-func looksLikeAddress(s string) bool {
-	for _, r := range s {
+func lookupDNSParallel(ctx context.Context, dnsHosts []string) ([]hostTarget, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+		out      = make([]hostTarget, 0, len(dnsHosts))
+	)
+
+	setErr := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if firstErr != nil {
+			return
+		}
+		firstErr = err
+		cancel()
+	}
+
+	for _, host := range dnsHosts {
+		wg.Add(1)
+		go func(host string) {
+			defer wg.Done()
+
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					setErr(fmt.Errorf("dns lookup %q: %w", host, err))
+					return
+				}
+
+				setErr(ResolveError{
+					Kind:  resolveErrUnresolvableDNS,
+					Host:  host,
+					Cause: err,
+				})
+				return
+			}
+
+			mu.Lock()
+			if firstErr == nil {
+				for _, ipAddr := range ips {
+					out = append(out, hostTarget{host: host, ip: ipAddr.IP})
+				}
+			}
+			mu.Unlock()
+		}(host)
+	}
+
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return out, nil
+}
+
+func looksLikeAddress(host string) bool {
+	for _, r := range host {
 		if (r >= '0' && r <= '9') || r == '.' || r == ':' || r == '[' || r == ']' {
 			continue
 		}

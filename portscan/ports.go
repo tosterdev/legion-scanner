@@ -1,15 +1,15 @@
 package portscan
 
-import (
-	"errors"
-	"sort"
+const (
+	minPort = 1
+	maxPort = 65535
 )
 
 type PortSet struct {
 	items []portItem
 }
 
-type portItemKind uint8
+type portItemKind int
 
 const (
 	portItemRange portItemKind = iota
@@ -48,10 +48,14 @@ func Ports(list ...int) PortSet {
 
 func Join(sets ...PortSet) PortSet {
 	var items []portItem
-	for _, s := range sets {
-		items = append(items, s.items...)
+	for _, set := range sets {
+		items = append(items, set.items...)
 	}
 	return PortSet{items: items}
+}
+
+func validPort(port int) bool {
+	return port >= minPort && port <= maxPort
 }
 
 func (ps PortSet) validateAndExpand() ([]uint16, error) {
@@ -69,35 +73,36 @@ func (ps PortSet) validateAndExpand() ([]uint16, error) {
 				from, to = to, from
 			}
 
-			if from < 1 || from > 65535 {
-				return nil, &PortError{Kind: "range_start", Value: from}
+			if !validPort(from) {
+				return nil, PortError{Kind: "range_start", Value: from}
 			}
-			if to < 1 || to > 65535 {
-				return nil, &PortError{Kind: "range_end", Value: to}
+			if !validPort(to) {
+				return nil, PortError{Kind: "range_end", Value: to}
 			}
 
-			for p := from; p <= to; p++ {
+			for port := from; port <= to; port++ {
 				// дедупликация: в uniq остаются только уникальные порты
-				uniq[uint16(p)] = struct{}{}
+				uniq[uint16(port)] = struct{}{}
 			}
 		case portItemList:
-			for _, p := range item.ports {
-				if p < 1 || p > 65535 {
-					return nil, &PortError{Kind: "port", Value: p}
+			for _, port := range item.ports {
+				if !validPort(port) {
+					return nil, PortError{Kind: "port", Value: port}
 				}
 				// дедупликация списка портов
-				uniq[uint16(p)] = struct{}{}
+				uniq[uint16(port)] = struct{}{}
 			}
 		default:
-			return nil, errors.New("unknown port item kind")
+			return nil, ErrUnknownPortItem
 		}
 	}
 
-	out := make([]uint16, 0, len(uniq))
-	for p := range uniq {
-		out = append(out, p)
+	out := make([]uint16, len(uniq))
+	i := 0
+	for port := range uniq {
+		out[i] = port
+		i++
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out, nil
 }
 
@@ -106,6 +111,6 @@ type PortError struct {
 	Value int
 }
 
-func (e *PortError) Error() string {
+func (e PortError) Error() string {
 	return "invalid port " + e.Kind
 }
